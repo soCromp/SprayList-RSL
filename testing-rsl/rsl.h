@@ -34,8 +34,8 @@
 
 
 class rsl {
-    const static int data_exp = 5;
-    const static int index_exp = 5;
+    const static int data_exp = 8;
+    const static int index_exp = 8;
     int LAYERS; //num index layers
     /// node_t is used for both the data layer and the index layer(s)
     template <typename T, int EXP> struct node_t {
@@ -411,7 +411,8 @@ class rsl {
     constexpr int target_idx_chunk_size = 1 << index_exp;
 
     static thread_local __uint128_t g_lehmer64_state =
-        lehmer64_seed((uint64_t) pthread_self());
+        lehmer64_seed((uint64_t) 0);
+        //lehmer64_seed((uint64_t) pthread_self());  
     uint64_t r = lehmer64(g_lehmer64_state);
     int result = 0;
 
@@ -442,27 +443,27 @@ class rsl {
   /// the sum of their sizes is under the merge threshold, or if b is totally
   /// empty.
   bool should_merge(index_t *a, index_t *b) {
-
-
-
-    if(index_exp == 2)
-        return b->v.get_size() == 0;
+    // Merges should never happen in skiplist simulation mode unless b is
+    // totally empty. As INDEX_EXP is a templated value, this check gets
+    // optimized out by the compiler.
+    if (index_exp == 2)
+      return b->v.get_size() == 0;
 
     const uint16_t idx_merge_threshold = merge_threshold * (1 << index_exp);
-    return b->v.get_size() == 0 || 
-            (a->v.get_size() + b->v.get_size() < idx_merge_threshold);
+    return b->v.get_size() == 0 ||
+           (a->v.get_size() + b->v.get_size() < idx_merge_threshold);
   }
 
   bool should_merge(data_t *a, data_t *b) {
+    // Merges should never happen in skiplist simulation mode unless b is
+    // totally empty. As DATA_EXP is a templated value, this check gets
+    // optimized out by the compiler.
+    if (data_exp == 2)
+      return b->v.get_size() == 0;
 
-
-
-    if(data_exp == 2)
-        return b->v.get_size() == 0;
-    
     const uint16_t data_merge_threshold = merge_threshold * (1 << data_exp);
-    return b->v.get_size() == 0 || 
-        (a->v.get_size() + b->v.get_size() < data_merge_threshold);
+    return b->v.get_size() == 0 ||
+           (a->v.get_size() + b->v.get_size() < data_merge_threshold);
   }
 
   /// Helper function that determines if a search should continue to the next
@@ -483,112 +484,112 @@ class rsl {
     // return true.
     T *next = curr->next;
     slkey_t last = k;
-    while(next != nullptr && (!curr->v.last(last) || k > last)) {
-        // Take a hazard pointer on next, then make sure curr hasn't changed
-        hp_context->take(next);
-        if (!curr->lock.confirm_read(curr_lock)) {
-            hp_context->drop_next();
-            return false;
-        }
+    while (next != nullptr && (!curr->v.last(last) || k > last)) {
+      // Take a hazard pointer on next, then make sure curr hasn't changed
+      hp_context->take(next);
+      if (!curr->lock.confirm_read(curr_lock)) {
+        hp_context->drop_next();
+        return false;
+      }
 
-        // Read next's sequence lock.  If it's deleted, we need to retry
-        uint64_t next_lock = next->lock.begin_read();
-        if (sv_lock::is_dead(next_lock)) {
-            hp_context->drop_next();
-            return false;
-        }
+      // Read next's sequence lock.  If it's deleted, we need to retry
+      uint64_t next_lock = next->lock.begin_read();
+      if (sv_lock::is_dead(next_lock)) {
+        hp_context->drop_next();
+        return false;
+      }
 
-        // Check if /next/ needs to be removed (and possibly merged first)
-        // - remove if it's an empty orphan
-        // - merge+remove if it's an orphan and cleanup == should_merge() == true
-        //
-        // [mfs] The guard for this /if/ is the same as the guard for the
-        //       do/while.  It's probably possible to refactor into a single
-        //       /while/ loop
-        if (sv_lock::is_orphan(next_lock) &&
+      // Check if /next/ needs to be removed (and possibly merged first)
+      // - remove if it's an empty orphan
+      // - merge+remove if it's an orphan and cleanup == should_merge() == true
+      //
+      // [mfs] The guard for this /if/ is the same as the guard for the
+      //       do/while.  It's probably possible to refactor into a single
+      //       /while/ loop
+      if (sv_lock::is_orphan(next_lock) &&
           ((cleanup && should_merge(curr, next)) || next->v.get_size() == 0)) {
 
-            // [mfs] This logic should be very infrequently needed.  I think we'd be
-            //       better having it in a separate function, so that hopefully it
-            //       doesn't get inlined
+        // [mfs] This logic should be very infrequently needed.  I think we'd be
+        //       better having it in a separate function, so that hopefully it
+        //       doesn't get inlined
 
-            // Get write lock on curr, since we'll modify curr->next
-            if (!curr->lock.upgrade(curr_lock)) {
-                hp_context->drop_next();
-                return false;
-            }
-
-            // We unlink in a loop, since there may be multiple orphans
-            bool changed = false;
-            do {
-                // Acquire next, so we can mark it deleted
-                if (!next->lock.upgrade(next_lock)) {
-                    curr->lock.release_changed_if(changed); // may downgrade curr->lock
-                    hp_context->drop_next();
-                    return false;
-                }
-
-                // Mark next dead, unlink it, and mark it for reclamation.
-                curr->merge();
-                hp_context->drop_next();
-                hp_context->reclaim(next);
-                next = curr->next;
-                changed = true;
-
-                // We may need to keep looping.  Next==null is the easy exit case
-                if (next == nullptr) {
-                    curr_lock = curr->lock.release();
-                    return true;
-                }
-
-                // NB: We don't have to check if next is dead or take a hazard pointer
-                //     on it because we have its predecessor locked as a writer.  Even
-                //     if it's not an orphan, it can't be deleted without holding a
-                //     lock on its predecessor, and we have that lock.
-                next_lock = next->lock.begin_read();
-            } while (
-                sv_lock::is_orphan(next_lock) &&
-                ((cleanup && should_merge(curr, next)) || next->v.get_size() == 0) );
-            
-            if(cleanup) {
-                // If the cleanup flag is enabled, merging may have eliminated the
-                // need to check next, so start again from the top.
-                //
-                // NB: curr->lock.release() still gives us a read lock on curr
-                curr_lock = curr->lock.release();
-                continue;
-            } else {
-                // Before we release the write lock on curr, we need to take a hazard
-                // pointer on next, so that we can continue to access it safely after
-                // the release.
-                hp_context->take(next);
-                curr_lock = curr->lock.release();
-            }
-        } //ends if at 506 inside while
-
-        // At this point we know that we have a nonempty next.
-        if (k < next->v.first()) {
-            // Next's first element is after k, so we have ruled out next.
-            // Now we just need to check its sequence lock.
-            // Return true if the check succeeds, false if it fails.
-            bool result = next->lock.confirm_read(next_lock);
-            hp_context->drop_next();
-            return result;
+        // Get write lock on curr, since we'll modify curr->next
+        if (!curr->lock.upgrade(curr_lock)) {
+          hp_context->drop_next();
+          return false;
         }
 
-        // Next's first element is before (or equal to) the sought key,
-        // so we to go to next and repeat from there. We're done with curr,
-        // so we just need to confirm its sequence lock hasn't changed.
-        if (!curr->lock.confirm_read(curr_lock)) {
+        // We unlink in a loop, since there may be multiple orphans
+        bool changed = false;
+        do {
+          // Acquire next, so we can mark it deleted
+          if (!next->lock.upgrade(next_lock)) {
+            curr->lock.release_changed_if(changed); // may downgrade curr->lock
             hp_context->drop_next();
             return false;
-        }
+          }
 
-        curr = next;
-        curr_lock = next_lock;
-        next = curr->next;
-        hp_context->drop_curr();
-    } //ends while at 484 in check_next
+          // Mark next dead, unlink it, and mark it for reclamation.
+          curr->merge();
+          hp_context->drop_next();
+          hp_context->reclaim(next);
+          next = curr->next;
+          changed = true;
+
+          // We may need to keep looping.  Next==null is the easy exit case
+          if (next == nullptr) {
+            curr_lock = curr->lock.release();
+            return true;
+          }
+
+          // NB: We don't have to check if next is dead or take a hazard pointer
+          //     on it because we have its predecessor locked as a writer.  Even
+          //     if it's not an orphan, it can't be deleted without holding a
+          //     lock on its predecessor, and we have that lock.
+          next_lock = next->lock.begin_read();
+        } while (
+            sv_lock::is_orphan(next_lock) &&
+            ((cleanup && should_merge(curr, next)) || next->v.get_size() == 0));
+
+        if (cleanup) {
+          // If the cleanup flag is enabled, merging may have eliminated the
+          // need to check next, so start again from the top.
+          //
+          // NB: curr->lock.release() still gives us a read lock on curr
+          curr_lock = curr->lock.release();
+          continue;
+        } else {
+          // Before we release the write lock on curr, we need to take a hazard
+          // pointer on next, so that we can continue to access it safely after
+          // the release.
+          hp_context->take(next);
+          curr_lock = curr->lock.release();
+        }
+      }
+
+      // At this point we know that we have a nonempty next.
+      if (k < next->v.first()) {
+        // Next's first element is after k, so we have ruled out next.
+        // Now we just need to check its sequence lock.
+        // Return true if the check succeeds, false if it fails.
+        bool result = next->lock.confirm_read(next_lock);
+        hp_context->drop_next();
+        return result;
+      }
+
+      // Next's first element is before (or equal to) the sought key,
+      // so we to go to next and repeat from there. We're done with curr,
+      // so we just need to confirm its sequence lock hasn't changed.
+      if (!curr->lock.confirm_read(curr_lock)) {
+        hp_context->drop_next();
+        return false;
+      }
+
+      curr = next;
+      curr_lock = next_lock;
+      next = curr->next;
+      hp_context->drop_curr();
+    }
 
     // We ruled out next, so return true.
     return true;
@@ -636,8 +637,6 @@ class rsl {
     void *down_void = nullptr;
     if (curr->v.find_lte(k, down_void)) {
       down = static_cast<T *>(down_void);
-      if(down->v.first() != k) //incase it's interleaving with an orphanize()
-        return false;
     }
     // [mfs] Could simplify to return reader_swap()...
     return reader_swap<T>(curr, curr_lock, down);
@@ -811,7 +810,7 @@ public:
 
       // We use a single 64-bit random number on insert(), so make sure that's
       // enough for the chosen configuration.
-      assert(data_exp + (0 * index_exp) <= 64);
+      //assert(data_exp + (cfg->layers * index_exp) <= 64);
 
       size = 0;
 
@@ -821,7 +820,7 @@ public:
       }
 
       minchunk = new data_t();
-      minchunksz = -1;
+      minchunksz = 0;
       data_head = new data_t();
   }
 
@@ -950,7 +949,7 @@ public:
 
   /// Insert a new element into the RSL
   bool insert(const value_type &pair) {
-      //std::cerr << "insert " << pair.first << std::endl;
+    //std::cerr << "insert " << pair.first << std::endl;
     init_context();
 
     const slkey_t &k = pair.first;
@@ -960,7 +959,7 @@ public:
 
     // Do a lookup as though doing a contains() operation, but save references
     // to index nodes we'll need later in an array.
-    index_t *prev_nodes[LAYERS] = {nullptr}; //VScode is underlining this in red but it compiles no problem
+    index_t *prev_nodes[LAYERS] = {nullptr};
 
   top:
 
@@ -1021,7 +1020,7 @@ public:
       slkey_t found_k = k;
 
       if (curr->v.find_lte(k, found_k, down)) {
-        /*if (found_k == k) {
+        if (found_k == k) {
           // If we find k in the index layer, stop and return false.
           if (layer < new_height) {
             // If we locked any nodes,
@@ -1039,9 +1038,9 @@ public:
           }
           hp_context->drop_all();
           return false;
-        }*/
+        }
 
-        // We found an appropriate down pointer, so follow it.
+        // Otherwise, we found an appropriate down pointer, so follow it.
         if (layer > 0) {
           down_idx = static_cast<index_t *>(down);
         } else {
@@ -1122,7 +1121,8 @@ public:
     }
 
     // Generated height is at least 1, so we need to partition the data node.
-    /*if (curr_dl->v.contains(k)) {
+    // First we must manually check if the key is present in the data node.
+    if (curr_dl->v.contains(k)) {
       // If key is present, release everything and just return false.
       for (int i = 0; i < new_height; ++i) {
         prev_nodes[i]->lock.release_unchanged();
@@ -1130,9 +1130,9 @@ public:
       curr_dl->lock.release_unchanged();
       hp_context->drop_all();
       return false;
-    }*/
+    }
 
-    // Do the partition.
+    // Key isn't present, so do the partition.
 
     // Edge case: curr_dl may be full and the inserted key may be less than
     // its minimum. (This can only happen if it is leftmost.)
@@ -1188,103 +1188,110 @@ public:
     return true;
   } //ends insert method
 
+
+  int simple_count = 0;
+
   //extracts min, places it into the k and v passed in
   bool extract_min_concur(slkey_t *k, val_t *v, int tid) {
-    std::cout << "thread " << tid << " in exmin\n";
+    //std::cout << "thread " << tid << " in exmin\n";
     init_context();
-    std::cout << "1195 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+    //std::cout << "1195 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+    data_t *curmin = minchunk;
     
-    hp_context->take_first(minchunk);
-    if(minchunk->lock.is_locked()) {
-      std::cout << "minchunk is locked. giving up.\n";
+    hp_context->take_first(curmin);
+    if(curmin->lock.is_locked()) {
+      //std::cout << "minchunk is locked. giving up.\n";
       //minchunk->lock.confirm_read(lmin);
       hp_context->drop_all();
       return false;
     }
-    uint64_t lmin = minchunk->lock.begin_read();
+    uint64_t lmin = curmin->lock.begin_read();
     int64_t ind = next_minelem_ind();
-    std::cout << "1206 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+    //std::cout << "[exmin] thread " << tid << " ind = " << ind << std::endl;
+    //std::cout << "1206 minchunk lock val " << minchunk->lock.get_value() << std::endl;
     
-    if(ind < 0 && minchunk->lock.upgrade(lmin) ) { //get new minlist if neccessary
-      std::cout << "getting new minlist\n";
-      std::cout << "1210 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      /*if( !minchunk->lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else is 
-        std::cout << "new minlist already underway. giving up..\n";
-        minchunk->lock.confirm_read(lmin);
-        hp_context->drop_all();           ////already making new minlist. just restart
+    if(ind == -1  ) { //get new minlist if needed
+      //std::cout << "**** getting new minlist\n";
+      //std::cout << "1210 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      if( !curmin->lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else is 
+        //std::cout << "new minlist already underway. giving up..\n"; ////already making new minlist. just restart
+        curmin->lock.confirm_read(lmin);
+        hp_context->drop_all();           
         return false;
-      }*/
+      }
 
-      std::cout << "1218 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      //get head node
-      bool dh_acquire = data_head->lock.acquire();
-      std::cout << "acquire data head result: " << dh_acquire << std::endl;
+      //std::cout << "1218 minchunk lock val " << minchunk->lock.get_value() << std::endl;
 
      top:
+
+      //get head node
+      bool dh_acquire = data_head->lock.acquire();
+      //std::cout << "acquire data head result: " << dh_acquire << std::endl;
 
       //get 1st DL node
       data_t *n1 = data_head->next;
       if(n1 == nullptr) {
-        std::cout << "going to simple min\n";
+        //std::cout << "---- going to simple min " << ++simple_count << std::endl;
+        minchunksz = 0; //so another thread can try later
         data_head->lock.release();
-        minchunk->lock.release_unchanged();
+        curmin->lock.release_unchanged();
         hp_context->drop_all();
         return simple_extract_min(k,v);
       }
 
+      simple_count = 0;
+      //std::cout << ">>>> past simple\n";
+
       hp_context->take(n1);
       uint64_t l = n1->lock.begin_read();
-      std::cout << "1237 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "1237 minchunk lock val " << minchunk->lock.get_value() << std::endl;
 
       if(!n1->lock.is_orphan(l) ) {
-        std::cout << "need to orphanize. data head size is " << data_head->v.get_size() << 
-          " and n1 size is " << n1->v.get_size() << std::endl;
+        //std::cout << "need to orphanize. data head size is " << data_head->v.get_size() << 
+          //" and n1 size is " << n1->v.get_size() << std::endl;
         slkey_t deprop = n1->v.first(); //this elem was propagated to upper levels
         data_head->lock.release();
         hp_context->drop_all();
-        std::cout << "about to call orphanize method\n";
+        //std::cout << "about to call orphanize method\n";
         bool orphan = orphanize(deprop);
-        std::cout << "orphanize result: " << orphan << std::endl;
-        //goto top;
-        minchunk->lock.release_unchanged();
-        return false;
+        //std::cout << "orphanize result: " << orphan << std::endl;
+        goto top;
+        //minchunk->lock.release_unchanged();
+        //return false;
       }
 
-      std::cout << "1253 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "1253 minchunk lock val " << minchunk->lock.get_value() << std::endl;
       data_t *old_head = data_head;
       data_head = n1;
-      std::cout << "1256 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "1256 minchunk lock val " << minchunk->lock.get_value() << std::endl;
 
-      std::cout << "finishing new minlist procedure, releasing locks..\n";
-      minchunk->next = old_head;
-      std::cout << "data head size: " << old_head->v.get_size() << std::endl;
-      std::cout << "1261 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      minchunk->merge();
-      std::cout << "1263 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "finishing new minlist procedure, releasing locks..\n";
+      //minchunk->next = old_head; //start using actual minchunk reference here
+      //std::cout << "data head size: " << old_head->v.get_size() << " minchunk size: " << minchunk->v.get_size() << std::endl;
+      //std::cout << "1261 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //curmin->merge();
+      minchunk = old_head;
+      //std::cout << "1263 minchunk lock val " << minchunk->lock.get_value() << std::endl;
       minchunksz = minchunk->v.get_size();
-      std::cout << "1265 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      std::cout << "new minchunk size: " << minchunksz << std::endl;
-      std::cout << "1267 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "1265 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      //std::cout << "new minchunk size: " << minchunksz << std::endl;
+      //std::cout << "1267 minchunk lock val " << minchunk->lock.get_value() << std::endl;
       //hp_context->reclaim(old_head);
-      //minchunk->lock.release();
-      std::cout << "1270 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      minchunk->lock.release();
+      //std::cout << "1270 minchunk lock val " << minchunk->lock.get_value() << std::endl;
       hp_context->drop_all();
-      std::cout << "about to give up after making new minlist\n";
+      //std::cout << "about to give up after making new minlist\n";
       return extract_min_concur(k,v,tid);
-    } else if(ind < 0) {
-      std::cout << "waiting for minchunk to open up..\n";
-      while(ind < 0)
-        ind = next_minelem_ind();
     }
     
-    std::cout << "1275 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+    //std::cout << "1275 minchunk lock val " << minchunk->lock.get_value() << std::endl;
     //pop from min list
-    bool minread = minchunk->lock.confirm_read(lmin);
+    bool minread = curmin->lock.confirm_read(lmin);
     if(!minread) {
       hp_context->drop_all();
       return false;
     }
-    bool res = minchunk->v.removeInd(ind, *k, *v); //CHANGE: 0 USED TO BE VAR ind
+    bool res = curmin->v.removeInd(ind, *k, *v); 
     hp_context->drop_all();
     return res;
   }

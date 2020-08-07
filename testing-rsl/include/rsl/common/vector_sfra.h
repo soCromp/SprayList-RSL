@@ -23,9 +23,7 @@ template <typename K, typename V, int CAPACITY> class vector_sfra {
   rlx_atomic<int> size = 0;
 
   /// Internal function used to find a key in the vector.
-  /// If it exists, it returns the exact position. 
-  /// If multiple entries with the same key exist, it returns 
-  /// a position somewhere in the region where those keys are.
+  /// If it exists, it returns the exact position;
   /// Otherwise, the position it should be inserted into.
   /// A binary search that takes lg(n) time.
   int find(const K &k) const {
@@ -77,9 +75,9 @@ public:
     const K &k = pair.first;
     int start_pos = victim->find(k);
 
-    // commented out: (Assert that k is not in the victim vector.)
+    // Assert that k is not in the victim vector.
     // NB: first condition guards against out-of-bounds read on second condition
-    //assert(start_pos == victim->size);// || victim->key_list[start_pos] != k);
+    assert(start_pos == victim->size || victim->key_list[start_pos] != k);
 
     int entries_to_steal = victim->size - start_pos;
 
@@ -119,9 +117,9 @@ public:
     // First, determine where the inserted element should go.
     int insert_pos = victim->find(k);
 
-    // Commented out: (Assert that k is not in the victim vector).
+    // Assert that k is not in the victim vector.
     // NB: first condition guards against out-of-bounds read on second condition
-    //assert(insert_pos == victim->size);// || victim->key_list[insert_pos] != k);
+    assert(insert_pos == victim->size || victim->key_list[insert_pos] != k);
 
     // NB: We slightly abuse the term "median" here. Normally, if the number of
     // elements is even, the median is between the two elements in the middle.
@@ -227,18 +225,19 @@ public:
   }
 
   /// Insert a new element into the list.
-  /// If there isn't room to insert it,
+  /// If already exists, do nothing and return false.
+  /// If it does not exist, but there isn't room to insert it,
   /// mark the overfull parameter true and return false.
   bool insert(const value_type &pair, bool &overfull) {
     const K &k = pair.first;
 
     int pos = find(k);
 
-    /*if (pos < size && key_list[pos] == k) {
+    if (pos < size && key_list[pos] == k) {
       // Already exists
       overfull = false;
       return false;
-    }*/
+    }
 
     // Prevent vector from becoming overfull
     if (size == CAPACITY) {
@@ -263,7 +262,8 @@ public:
   }
 
   /// Insert a new element into the list.
-  /// If there isn't room to insert it,
+  /// If already exists, do nothing and return false.
+  /// If it does not exist, but there isn't room to insert it,
   /// an assert will fail.
   bool insert(const value_type &pair) {
     bool overfull = false;
@@ -459,7 +459,7 @@ public:
 
     // Check that keys are monotonically increasing
     for (int i = 1; i < size; ++i) {
-      if (key_list[i] < key_list[i - 1]) {
+      if (key_list[i] <= key_list[i - 1]) {
         std::cout << "Verification failed! Key " << +key_list[i - 1]
                   << " is at position " << i - 1 << ", but key " << +key_list[i]
                   << " is at position " << i << "!" << std::endl;

@@ -155,29 +155,21 @@ void* sssp(void *data) {
   //rsl_insert(d->rpq, (pkey_t) 1, (pval_t) 1);
 
   int fail = 0;
+  int num_inserts = 0;
   // int radius = 0;
   while (1) {
-    if(d->rsl) {
-      //printf("at top of big while.\n");//, rsl_size(d->rpq));
-      /*if(rsl_size(d->rpq) == 0) {
-        printf("queue empty at loop top so stopping\n");
-        break;
-      }*/
-    }
     val_t node;
     slkey_t dist_node;
     while (1) { 
      //printf("in smaller while\n");
      if (d->sl) {
        if (spray_delete_min_key(d->set, &dist_node, &node, d)) {
-         printf("%d\t%d\n", dist_node, node);
+         //printf("%d\t%d\n", dist_node, node);
          break;
-        } else {
-          printf("wasn't there\n");
-        }
+        } 
      } else if (d->pq) {
        if (lotan_shavit_delete_min_key(d->set, &dist_node, &node, d)) {
-         printf("%d\t%d\n", dist_node, node);
+         //printf("%d\t%d\n", dist_node, node);
          break;
         }
      } else if (d->lin) {
@@ -189,24 +181,24 @@ void* sssp(void *data) {
      else if (d->rsl) {
        //printf("here\n");
        if(rsl_extract_min(d->rpq, &dist_node, &node, d->id) == 1) { //keep trying until successful. returns 0 if another thread is busy
-         printf("extracted %d\t%d\n", dist_node, node);
-         printf("breaking\n");
+         //printf("      extract %d\t%d\n", dist_node, node);
+         //printf("breaking\n");
          break; //0==failed
-         printf("unreachable statement\n");
+         //printf("unreachable statement\n");
        }
      } else {
        //printf("error: no queue selected\n");
        exit(1);
      }
      if (dist_node == -1) { // flag that list is empty
-       printf("flag that list is empty\n");
+       //printf("flag that list is empty\n");
        break;
      }
      dist_node = 0;
     }
     
     if (((int)dist_node) == -1) { // list is empty; TODO make sure threads don't quit early
-      printf("fail detected\n");
+      //printf("fail detected\n");
       fail++;
       if (fail > 20*d->nb_threads) { // TODO: really need a better break condition...
         break;
@@ -250,10 +242,14 @@ void* sssp(void *data) {
             insert(d->linden_set, dist_node+w, v);
             //printf("    after insert\n");
           } else if (d->rsl) {
-            printf("    before insert of %d %d\n", dist_node+w, v);
+            //printf("    insert %d %d\n", dist_node+w, v);
             int in = rsl_insert(d->rpq, dist_node+w, v, (d->id)+(d->nb_threads)*(d->rpqInserts) );
             d->rpqInserts++;
-            printf("    after insert, result of which was %d\n", in);
+            //num_inserts++;
+
+            //if(num_inserts % 100 == 0)
+              //fprintf(stderr, "+");
+            //printf("    after insert, result of which was %d\n", in);
           }
           d->nb_add++;
         } else {
@@ -587,7 +583,7 @@ int main(int argc, char **argv)
   //RSL
   if (rsl) {
     setup_t s;
-    s.layers = 16;
+    s.layers = 32;
     rpq = rsl_create(&s);
     int res = rsl_insert(rpq, (pkey_t) 1, (pval_t) src, 0);
     nodes[src].dist = 1;
