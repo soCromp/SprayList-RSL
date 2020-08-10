@@ -109,8 +109,6 @@ class rsl {
         bool is_orphan_seq() { return sv_lock::is_orphan(lock.get_value()); }
     };
 
-  int size;
-
   /// [mfs] Even though "virtual is bad", we could simplify the code a lot by
   ///       having a base class that has a virtual destuctor, and then making
   ///       index_t and data_t inherit from it.  Among other things, this would
@@ -124,8 +122,8 @@ class rsl {
   /// type of data nodes.  A data node's vector holds key/val pairs
   typedef node_t<val_t, data_exp> data_t;
 
-  data_t *minchunk; //chilling chunk for extract min
-  int64_t minchunksz; //size of chilling chunk
+  std::atomic <data_t *> minchunk; //chilling chunk for extract min
+  std::atomic <int64_t> minchunksz; //size of chilling chunk
 
   /// A thread hazard pointer context.  This specific context type assumes we
   /// are doing hand-over-hand list traversals, and thus only ever need two
@@ -388,7 +386,7 @@ class rsl {
   index_t *index_head[100];
 
   /// Leftmost data vector.
-  data_t *data_head;
+  std::atomic <data_t *> data_head;
 
   /// Create a context for the thread, if one doesn't exist
   void init_context() {
@@ -794,7 +792,7 @@ class rsl {
   //fetch and decrement for concurrent extract min operation. be holding hazard pointer when call!
   int64_t next_minelem_ind() {
         return --minchunksz;
-    }
+  }
 
 public:
   /// insert() takes a reference to a key/val pair, so we expose the type here
@@ -811,8 +809,6 @@ public:
       // We use a single 64-bit random number on insert(), so make sure that's
       // enough for the chosen configuration.
       //assert(data_exp + (cfg->layers * index_exp) <= 64);
-
-      size = 0;
 
       for(int i = 0; i < layers; i++) {
         //index_t *n = new index_t();
@@ -1193,98 +1189,89 @@ public:
 
   //extracts min, places it into the k and v passed in
   bool extract_min_concur(slkey_t *k, val_t *v, int tid) {
-    //std::cout << "thread " << tid << " in exmin\n";
+    std::cout << "thread " << tid << " in exmin\n";
     init_context();
-    //std::cout << "1195 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+   acquire:
     data_t *curmin = minchunk;
     
     hp_context->take_first(curmin);
-    if(curmin->lock.is_locked()) {
-      //std::cout << "minchunk is locked. giving up.\n";
-      //minchunk->lock.confirm_read(lmin);
-      hp_context->drop_all();
-      return false;
-    }
+    if(curmin != minchunk)
+      goto acquire;
     uint64_t lmin = curmin->lock.begin_read();
     int64_t ind = next_minelem_ind();
-    //std::cout << "[exmin] thread " << tid << " ind = " << ind << std::endl;
-    //std::cout << "1206 minchunk lock val " << minchunk->lock.get_value() << std::endl;
     
     if(ind == -1  ) { //get new minlist if needed
-      //std::cout << "**** getting new minlist\n";
-      //std::cout << "1210 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      if( !curmin->lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else is 
-        //std::cout << "new minlist already underway. giving up..\n"; ////already making new minlist. just restart
+      std::cout << "need new minlist\n";
+      if( !curmin->lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else has it 
+        std::cout << "can't acquire lock\n";
+        minchunksz = 0;
         curmin->lock.confirm_read(lmin);
         hp_context->drop_all();           
         return false;
       }
 
-      //std::cout << "1218 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-
      top:
 
       //get head node
-      bool dh_acquire = data_head->lock.acquire();
-      //std::cout << "acquire data head result: " << dh_acquire << std::endl;
+      if( !(*data_head).lock.acquire() ) {
+        std::cout << "couldn't acquire data_head lock\n";
+        minchunksz = 0;
+        curmin->lock.release_unchanged();
+        hp_context->drop_all();
+        return false;
+      }
 
       //get 1st DL node
-      data_t *n1 = data_head->next;
-      if(n1 == nullptr) {
-        //std::cout << "---- going to simple min " << ++simple_count << std::endl;
+      data_t *n1 = (*data_head).next;
+      if(n1 == nullptr) { //usually means the structure is nearly empty, or maybe a cleaning thread is needed
         minchunksz = 0; //so another thread can try later
-        data_head->lock.release();
+        (*data_head).lock.release();
         curmin->lock.release_unchanged();
         hp_context->drop_all();
         return simple_extract_min(k,v);
       }
 
-      simple_count = 0;
-      //std::cout << ">>>> past simple\n";
-
       hp_context->take(n1);
+      while(n1 != (*data_head).next) {
+        std::cout << "updating n1\n";
+        n1 = (*data_head).next;
+        hp_context->take(n1);
+      }
       uint64_t l = n1->lock.begin_read();
-      //std::cout << "1237 minchunk lock val " << minchunk->lock.get_value() << std::endl;
 
       if(!n1->lock.is_orphan(l) ) {
-        //std::cout << "need to orphanize. data head size is " << data_head->v.get_size() << 
-          //" and n1 size is " << n1->v.get_size() << std::endl;
+        std::cout << "orphanize\n";
         slkey_t deprop = n1->v.first(); //this elem was propagated to upper levels
-        data_head->lock.release();
+        (*data_head).lock.release();
         hp_context->drop_all();
-        //std::cout << "about to call orphanize method\n";
-        bool orphan = orphanize(deprop);
-        //std::cout << "orphanize result: " << orphan << std::endl;
+        bool orphan = orphanize(deprop);  //to try: let orphanize itself find deprop?
+        std::cout << "orphanize complete\n";
         goto top;
-        //minchunk->lock.release_unchanged();
-        //return false;
       }
 
-      //std::cout << "1253 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      data_t *old_head = data_head;
+      /*data_t *old_head = data_head;
       data_head = n1;
-      //std::cout << "1256 minchunk lock val " << minchunk->lock.get_value() << std::endl;
 
-      //std::cout << "finishing new minlist procedure, releasing locks..\n";
-      //minchunk->next = old_head; //start using actual minchunk reference here
-      //std::cout << "data head size: " << old_head->v.get_size() << " minchunk size: " << minchunk->v.get_size() << std::endl;
-      //std::cout << "1261 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      //curmin->merge();
-      minchunk = old_head;
-      //std::cout << "1263 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      minchunksz = minchunk->v.get_size();
-      //std::cout << "1265 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      //std::cout << "new minchunk size: " << minchunksz << std::endl;
-      //std::cout << "1267 minchunk lock val " << minchunk->lock.get_value() << std::endl;
-      //hp_context->reclaim(old_head);
-      minchunk->lock.release();
-      //std::cout << "1270 minchunk lock val " << minchunk->lock.get_value() << std::endl;
+      std::cout << "finishing new minlist procedure, releasing locks..\n";
+      
+      (*curmin).lock.release();
+      minchunk = old_head;*/
+      std::cout << "releasing locks..\n";
+
+      data_t *chunk = data_head;
+
+      (*curmin).lock.release();
+      minchunk = chunk;
+      data_head = n1;
+
+      minchunksz = (*minchunk).v.get_size();
+      (*minchunk).lock.release();
+
       hp_context->drop_all();
-      //std::cout << "about to give up after making new minlist\n";
-      return extract_min_concur(k,v,tid);
+      std::cout << "about to give up after making new minlist\n";
+      return extract_min_concur(k, v, tid);
     }
     
-    //std::cout << "1275 minchunk lock val " << minchunk->lock.get_value() << std::endl;
     //pop from min list
     bool minread = curmin->lock.confirm_read(lmin);
     if(!minread) {
@@ -1292,6 +1279,8 @@ public:
       return false;
     }
     bool res = curmin->v.removeInd(ind, *k, *v); 
+    if(!res)
+      std::cout << "vector remove ind " << ind << " fails. vec size " << curmin->v.get_size() << std::endl;
     hp_context->drop_all();
     return res;
   }
@@ -1300,19 +1289,19 @@ public:
   //without creating new minlist
   bool simple_extract_min(slkey_t *k, val_t *v) {
     //std::cout << "in simple\n";
-    data_head->lock.acquire();
-    if(data_head->v.get_size() <= 0) {
-      data_head->lock.release();
+    (*data_head).lock.acquire();
+    if((*data_head).v.get_size() <= 0) {
+      (*data_head).lock.release();
       *k = -1;
       *v = -1; //use -1 as a sign that the structure is empty
       return true;
     }
-    *k = data_head->v.first();
+    *k = (*data_head).v.first();
     //data_head->v.last(*k);
     //std::cout << "about to remove, vec size is " << data_head->v.get_size() << std::endl;
-    bool res = data_head->v.remove(*k, *v);
+    bool res = (*data_head).v.remove(*k, *v);
     //std::cout << "did remove, returning " << (int) res << std::endl;
-    data_head->lock.release();
+    (*data_head).lock.release();
     return res;
   }
 
@@ -1325,7 +1314,7 @@ public:
       result += (int) curr->v.get_size();
       curr = curr->next;
     }
-    result += (int) minchunk->v.get_size();
+    result += (int) (*minchunk).v.get_size();
     //std::cout << result << std::endl;
     return result;
   }

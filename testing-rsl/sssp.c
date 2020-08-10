@@ -181,7 +181,7 @@ void* sssp(void *data) {
      else if (d->rsl) {
        //printf("here\n");
        if(rsl_extract_min(d->rpq, &dist_node, &node, d->id) == 1) { //keep trying until successful. returns 0 if another thread is busy
-         //printf("      extract %d\t%d\n", dist_node, node);
+         printf("      t%d extract %d\t%d\n", d->id, dist_node, node);
          //printf("breaking\n");
          break; //0==failed
          //printf("unreachable statement\n");
@@ -198,8 +198,8 @@ void* sssp(void *data) {
     }
     
     if (((int)dist_node) == -1) { // list is empty; TODO make sure threads don't quit early
-      //printf("fail detected\n");
       fail++;
+      printf("fail detected %d\n", fail);
       if (fail > 20*d->nb_threads) { // TODO: really need a better break condition...
         break;
       }
