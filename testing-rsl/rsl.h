@@ -1195,17 +1195,17 @@ public:
     data_t *curmin = minchunk;
     
     hp_context->take_first(curmin);
-    if(curmin != minchunk)
+    if(curmin != minchunk && curmin->v.get_size() == 0)
       goto acquire;
-    uint64_t lmin = curmin->lock.begin_read();
+    uint64_t lmin = curmin->lock.begin_read(); //n: maybe not needed
     int64_t ind = next_minelem_ind();
     
     if(ind == -1  ) { //get new minlist if needed
       std::cout << "need new minlist\n";
-      if( !curmin->lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else has it 
+      hp_context->drop_all();
+      if( !(*curmin).lock.upgrade(lmin) ) { //can't acquire lock, meaning someone else has it 
         std::cout << "can't acquire lock\n";
         minchunksz = 0;
-        curmin->lock.confirm_read(lmin);
         hp_context->drop_all();           
         return false;
       }
@@ -1216,17 +1216,17 @@ public:
       if( !(*data_head).lock.acquire() ) {
         std::cout << "couldn't acquire data_head lock\n";
         minchunksz = 0;
-        curmin->lock.release_unchanged();
+        (*curmin).lock.release_unchanged();
         hp_context->drop_all();
         return false;
       }
 
       //get 1st DL node
       data_t *n1 = (*data_head).next;
-      if(n1 == nullptr) { //usually means the structure is nearly empty, or maybe a cleaning thread is needed
-        minchunksz = 0; //so another thread can try later
+      if(n1 == nullptr) { //usually means the structure is nearly empty
         (*data_head).lock.release();
-        curmin->lock.release_unchanged();
+        (*curmin).lock.release_unchanged();
+        minchunksz = 0; //so another thread can try later
         hp_context->drop_all();
         return simple_extract_min(k,v);
       }
@@ -1265,7 +1265,7 @@ public:
       data_head = n1;
 
       minchunksz = (*minchunk).v.get_size();
-      (*minchunk).lock.release();
+      //(*minchunk).lock.release();
 
       hp_context->drop_all();
       std::cout << "about to give up after making new minlist\n";
